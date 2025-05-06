@@ -42,7 +42,7 @@ def reg_face(contents):
     faces = detect_faces(frame)
 
     if len(faces) != 1:
-        return None, "Face not detected or multiple faces detected"
+        return None, None, "Face not detected or multiple faces detected"
 
     (x, y, w, h) = faces[0]  # Get face bounding box
     face_crop = frame[y:y+h, x:x+w]  # Crop the detected face
@@ -54,7 +54,11 @@ def reg_face(contents):
             emb = np.array(emb, dtype=np.float32)
             embeddings.append(emb)
 
+        current_embedding = np.median(np.array(embeddings), axis=0)
+        current_embedding = current_embedding / np.linalg.norm(current_embedding)  # Normalize
+        current_embedding = current_embedding.reshape(1, -1)
+
         stored_embeddings = np.array(embeddings, dtype=np.float32).tobytes()
-        return stored_embeddings, "Done"
+        return stored_embeddings, current_embedding,  "Done"
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
