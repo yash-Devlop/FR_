@@ -1,54 +1,64 @@
 import pyodbc
 from fastapi import HTTPException
-def get_db_connection():
+
+
+def get_db_connection(database):
+    database = database.lower()
+    database = "_".join(database.split(" ")) + "DB"
+    server = 'MSI\\SQLEXPRESS01'
+    server = 'localhost,1433'
+    uid = "sa"
+    pwd = 'Mohit@123'
+
     return pyodbc.connect(
         "DRIVER={ODBC Driver 17 for SQL Server};"
-        "SERVER=localhost,1433;"
-        "DATABASE=FaceRecognitionDB;"
-        "UID=sa;"
-        "PWD=Mohit@123;"
-        "TrustServerCertificate=yes;"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"UID={uid};"
+        f"PWD={pwd};"
+        "Trusted_Connection=yes;",
+        autocommit=True
     )
 
-def initialize_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='registered_faces' AND xtype='U')
-        CREATE TABLE registered_faces (
-            id INT PRIMARY KEY IDENTITY,
-            name NVARCHAR(100),
-            embedding VARBINARY(512),  -- 128 * 4 bytes (float32)
-            created_at DATETIME DEFAULT GETDATE()
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
+def initialize_db(db_name: str):
+    server = 'MSI\\SQLEXPRESS01'
+    db_up_name = db_name.lower()
+    db_up_name = "_".join(db_up_name.split(" ")) + "DB"
 
-def initialize_db_all():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    conn_init = None
+    connd = None
 
     try:
+        conn_init = pyodbc.connect(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={server};"
+            "Trusted_Connection=yes;",
+            autocommit=True
+        )
+        cursor_init = conn_init.cursor()
+        cursor_init.execute(f"CREATE DATABASE {db_up_name};")
+        conn_init.commit()
+        print("database created")
+
+        connd = get_db_connection(db_name)
+        cursor = connd.cursor()
+
         # Employees
         cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.Employees') AND type = 'U')
-            BEGIN
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Employees' AND xtype='U')
                 CREATE TABLE Employees(
-                    EmpId INT PRIMARY KEY IDENTITY (1,1),
+                    EmpId INT PRIMARY KEY IDENTITY (101,1),
                     Name NVARCHAR(50) NOT NULL,
                     Department NVARCHAR(50) NOT NULL,
                     Image VARBINARY(MAX),
                     Status NVARCHAR(50)
                 );
-            END
         """)
 
         # EmpAttendance
         cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.EmpAttendance') AND type = 'U')
-            BEGIN
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='EmpAttendance' AND xtype='U')
                 CREATE TABLE EmpAttendance(
                     Id INT PRIMARY KEY IDENTITY(1,1),
                     EmpId INT NOT NULL,
@@ -56,42 +66,38 @@ def initialize_db_all():
                     EntryTime DATETIME NOT NULL,
                     ExitTime DATETIME
                 );
-            END
         """)
 
         # Visitors
         cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.Visitors') AND type = 'U')
-            BEGIN
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Visitors' AND xtype='U')
                 CREATE TABLE Visitors(
-                    VisitorId INT PRIMARY KEY IDENTITY (1,1),
+                    VisitorId INT PRIMARY KEY IDENTITY (101,1),
                     Name NVARCHAR(50) NOT NULL,
                     Type NVARCHAR(50),
                     Image VARBINARY(MAX),
                     Status NVARCHAR(50)
                 );
-            END
         """)
 
         # VisitorEntry
         cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.VisitorEntry') AND type = 'U')
-            BEGIN
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='VisitorEntry' AND xtype='U')
                 CREATE TABLE VisitorEntry(
                     Id INT PRIMARY KEY IDENTITY (1,1),
                     VisitorId INT NOT NULL,
                     VisitorName NVARCHAR(50) NOT NULL,
                     Date DATETIME NOT NULL
                 );
-            END
         """)
-        
-        conn.commit()
 
     except Exception as e:
+        if connd:
+            connd.rollback()
         raise HTTPException(status_code=400, detail=f"Cannot create all tables: {e}")
+
     finally:
-        conn.close()
-
-
-initialize_db_all()
+        if conn_init:
+            conn_init.close()
+        if connd:
+            connd.close()
