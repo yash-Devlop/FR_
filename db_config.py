@@ -5,45 +5,47 @@ from fastapi import HTTPException
 def get_db_connection(database):
     database = database.lower()
     database = "_".join(database.split(" ")) + "DB"
-    server = 'MSI\\SQLEXPRESS01'
     server = 'localhost,1433'
-    uid = "sa"
-    pwd = 'Mohit@123'
+    UID = 'sa'
+    PWD = 'Mohit@123'
 
-    return pyodbc.connect(
+    connection_string = (
         "DRIVER={ODBC Driver 17 for SQL Server};"
         f"SERVER={server};"
         f"DATABASE={database};"
-        f"UID={uid};"
-        f"PWD={pwd};"
+        f"UID={UID};"
+        f"PWD={PWD};"
+        "Trusted_Connection=yes;"
+    )
+
+    return pyodbc.connect(connection_string, autocommit=True)
+
+
+def initialize_db(db_name: str):
+    server = 'localhost,1433'
+    db_up_name = db_name.lower()
+    db_up_name = "_".join(db_up_name.split(" ")) + "DB"
+
+    conn_init = pyodbc.connect(
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={server};"
         "Trusted_Connection=yes;",
         autocommit=True
     )
 
-
-def initialize_db(db_name: str):
-    server = 'MSI\\SQLEXPRESS01'
-    db_up_name = db_name.lower()
-    db_up_name = "_".join(db_up_name.split(" ")) + "DB"
-
-    conn_init = None
-    connd = None
-
     try:
-        conn_init = pyodbc.connect(
-            "DRIVER={ODBC Driver 17 for SQL Server};"
-            f"SERVER={server};"
-            "Trusted_Connection=yes;",
-            autocommit=True
-        )
         cursor_init = conn_init.cursor()
         cursor_init.execute(f"CREATE DATABASE {db_up_name};")
         conn_init.commit()
-        print("database created")
+    except Exception as e:
+        raise HTTPException(f"cannot create database: {e}")
+    finally: 
+        conn_init.close()
 
-        connd = get_db_connection(db_name)
-        cursor = connd.cursor()
+    connd = get_db_connection(db_name)
+    cursor = connd.cursor()
 
+    try:
         # Employees
         cursor.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Employees' AND xtype='U')
@@ -92,12 +94,8 @@ def initialize_db(db_name: str):
         """)
 
     except Exception as e:
-        if connd:
-            connd.rollback()
+        connd.rollback()
         raise HTTPException(status_code=400, detail=f"Cannot create all tables: {e}")
 
     finally:
-        if conn_init:
-            conn_init.close()
-        if connd:
-            connd.close()
+        connd.close()

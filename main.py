@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query
 from face_recognition import detect_faces, reg_face
-from db_config import get_db_connection
+from db_config import get_db_connection, initialize_db
 from deepface import DeepFace
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,7 +52,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-
+@app.post("/super/register_company")
 async def register_company(form: Company_register):
     for field_name, field_type in get_type_hints(Company_register).items():
         if field_type == str:
@@ -66,24 +66,22 @@ async def register_company(form: Company_register):
     if form.Cname.lower() == 'super':
         return {"status": "bad", "matches": "cannot-create-company-with-this-name"}
 
-    conn = None
-
     time = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-    try:
+    conn = get_db_connection("super")
+    cursor = conn.cursor()
 
-        conn = get_db_connection("super")
-        cursor = conn.cursor()
+    try:
 
         company_id = str(uuid.uuid4()) 
         hashed_password = bcrypt.hashpw(form.Cpass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
+        initialize_db(form.Cname)
         cursor.execute("""
             INSERT INTO Companies (Cid, Username, Cname, Cpass, Caddress, Cphone, City, State, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (company_id, form.Username, form.Cname, hashed_password, form.Caddress, form.Cphone, form.city, form.state, time))
 
-        initialize_db(form.Cname)
         conn.commit()
         return {"status": "ok", "detail": "company-registered"}
         
@@ -221,7 +219,6 @@ async def handle_subscription(Cid: str, duration: int):
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=f"Subscription error: {e}")
-        return
     finally:
         conn.close()
 
@@ -810,11 +807,11 @@ async def login(user_id: str = Form(...), password: str = Form(...)):
     
 
 @app.post("/company_login")
-async def company_login(Userid: str, password: str):
+async def company_login(Username: str, password: str):
     conn = get_db_connection("super")
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * from companies WHERE Userid = ?", (Userid,))
+        cursor.execute("SELECT * from companies WHERE Userid = ?", (Username,))
         User = cursor.fetchone()
 
         if not User:
@@ -957,22 +954,21 @@ async def get_visitor_data(Cname: str, VisitorId: int):
 
     try:
         cursor.execute("SELECT * FROM VisitorEntry WHERE VisitorId = ?;", (VisitorId,))
-        Visitors_data = cursor.fetchone()
+        visitor = cursor.fetchone()
 
-        if Visitors_data:
+        if visitor:
             return {
                 "status": "ok",
-                "matches": [
-                    {
+                "matches": {
                         "id": visitor[0],
                         "Vid": visitor[1],
                         "Vname": visitor[2],
                         "Entry_time": visitor[3]
-                    }
-                    for visitor in Visitors_data
-                ]
+                }
             }
         else:
             return({"status": "bad","matches": "data not found"})
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error fetching visitor data: {e}")
+    finally:
+        conn.close()
