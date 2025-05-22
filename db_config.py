@@ -15,7 +15,6 @@ def get_db_connection(database):
         f"DATABASE={database};"
         f"UID={UID};"
         f"PWD={PWD};"
-        "Trusted_Connection=yes;"
     )
 
     return pyodbc.connect(connection_string, autocommit=True)
@@ -28,8 +27,7 @@ def initialize_db(db_name: str):
 
     conn_init = pyodbc.connect(
         "DRIVER={ODBC Driver 17 for SQL Server};"
-        f"SERVER={server};"
-        "Trusted_Connection=yes;",
+        f"SERVER={server};",
         autocommit=True
     )
 

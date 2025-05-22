@@ -2,6 +2,7 @@ import base64
 import bcrypt
 import uuid
 import cv2
+import re
 import numpy as np
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query
 from face_recognition import detect_faces, reg_face
@@ -62,6 +63,9 @@ async def register_company(form: Company_register):
             
     if not form.Cphone.startswith("+91"):
         return {"status": "bad", "matches": "invalid-Cphone-prefix"}
+    
+    if len(form.Cname) != 13:
+        return {"status": "bad", "matches": "invalid-Cphone"}
 
     if form.Cname.lower() == 'super':
         return {"status": "bad", "matches": "cannot-create-company-with-this-name"}
@@ -72,27 +76,38 @@ async def register_company(form: Company_register):
     cursor = conn.cursor()
 
     try:
-
         company_id = str(uuid.uuid4()) 
         hashed_password = bcrypt.hashpw(form.Cpass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-        initialize_db(form.Cname)
         cursor.execute("""
             INSERT INTO Companies (Cid, Username, Cname, Cpass, Caddress, Cphone, City, State, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (company_id, form.Username, form.Cname, hashed_password, form.Caddress, form.Cphone, form.city, form.state, time))
 
+        initialize_db(form.Cname)
         conn.commit()
         return {"status": "ok", "detail": "company-registered"}
-        
+
     except Exception as e:
-        if conn:
-            conn.rollback()
+        conn.rollback()
+
+        error_msg = str(e).lower()
+        
+        match = re.search(r"violation of unique key constraint '.*'\. cannot insert duplicate key in object 'dbo\.companies'\. the duplicate key value is \((.*?)\)", error_msg)
+        if match:
+            dup_value = match.group(1).strip()
+
+            if dup_value == form.Cname.lower():
+                return {"status": "bad", "matches": "duplicate-cname"}
+            if dup_value == form.Username.lower():
+                return {"status": "bad", "matches": "duplicate-username"}
+            if dup_value == form.Cphone:
+                return {"status": "bad", "matches": "duplicate-cphone"}
+
         raise HTTPException(status_code=400, detail=f"cannot add company details: {e}")
     
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
 
 @app.post("/super/get_all_companies")
