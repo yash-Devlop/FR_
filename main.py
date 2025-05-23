@@ -3,15 +3,18 @@ import bcrypt
 import uuid
 import cv2
 import re
+import os
 import numpy as np
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query
+from jose import jwt, JWTError
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, File, UploadFile, Query, Depends, status, Security
 from face_recognition import detect_faces, reg_face
 from db_config import get_db_connection, initialize_db
 from deepface import DeepFace
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from collections import defaultdict
 from typing import Any, Optional, get_type_hints
@@ -20,6 +23,50 @@ from contextlib import asynccontextmanager
 from scheduler import subscription_reminder_task
 from subscription_cache import fill_company_status, get_status
 from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+load_dotenv()
+
+SECRET_KEY = os.getenv("JWT_SECRET")
+ALGORITHM = os.getenv("ALGORITHM")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES"))
+
+security = HTTPBearer()
+    
+async def get_current_super_admin(credentials: HTTPAuthorizationCredentials = Security(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": False})
+        role = payload.get("role")
+        if role != "super-admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have enough permissions"
+            )
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
+        )
+    
+def get_current_company_admin(credentials: HTTPAuthorizationCredentials = Security(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        role = payload.get("role")
+        if role != "company-admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have enough permissions"
+            )
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
+        )
+
 
 class Company_register(BaseModel):
     Username: str
@@ -30,6 +77,28 @@ class Company_register(BaseModel):
     state: str
     city: str
 
+class company_pass_change(BaseModel):
+    cid: str
+    new_pass: str
+
+class create_subscription(BaseModel):
+    cid: str
+    duration: int
+
+class get_all_subscriptions_by_id(BaseModel):
+    cid: str
+
+class update_subscriptions(BaseModel):
+    subid: int
+    status: str
+
+class super_login(BaseModel):
+    username: str
+    password: str
+
+class company_login(BaseModel):
+    username: str
+    password: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -54,7 +123,7 @@ app.add_middleware(
 )
 
 @app.post("/super/register_company")
-async def register_company(form: Company_register):
+async def register_company(form: Company_register, token_data: dict = Depends(get_current_super_admin)):
     for field_name, field_type in get_type_hints(Company_register).items():
         if field_type == str:
             value = getattr(form, field_name)
@@ -64,7 +133,7 @@ async def register_company(form: Company_register):
     if not form.Cphone.startswith("+91"):
         return {"status": "bad", "matches": "invalid-Cphone-prefix"}
     
-    if len(form.Cname) != 13:
+    if len(form.Cphone) != 13:
         return {"status": "bad", "matches": "invalid-Cphone"}
 
     if form.Cname.lower() == 'super':
@@ -111,7 +180,7 @@ async def register_company(form: Company_register):
 
 
 @app.post("/super/get_all_companies")
-async def get_all_companies():
+async def get_all_companies(token_data: dict = Depends(get_current_super_admin)):
 
     conn = get_db_connection("super")
     cursor = conn.cursor()
@@ -122,7 +191,7 @@ async def get_all_companies():
 
         if not companies:
             return {"status": "ok", "matches": "no-company-found"}
-        
+
         return {
             "status": "ok",
             "matches": [
@@ -146,22 +215,23 @@ async def get_all_companies():
 
 
 @app.post("/super/change_company_password")
-async def change_company_password(Cid: str, new_pass: str):
+async def change_company_password(form: company_pass_change, token_data: dict = Depends(get_current_super_admin)):
 
     conn = get_db_connection("super")
     cursor = conn.cursor()
 
     try:
         
-        hashed_password = bcrypt.hashpw(new_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        hashed_password = bcrypt.hashpw(form.new_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
         cursor.execute("""
             UPDATE Companies
             SET Cpass = ?
             WHERE Cid = ?
-        """, (hashed_password, Cid))
-
+        """, (hashed_password, form.cid))
+        conn.commit()
         return {"status": "ok", "matches": "password-changed"}
+
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"error updating password: {e}")
@@ -169,9 +239,9 @@ async def change_company_password(Cid: str, new_pass: str):
         conn.close()
 
 @app.post("/super/create_subscription")
-async def handle_subscription(Cid: str, duration: int):
+async def handle_subscription(form: create_subscription, token_data: dict = Depends(get_current_super_admin)):
 
-    if not 1 <= duration <= 60:
+    if not 1 <= form.duration <= 60:
         return {"status": "bad", "matches": "duration-invalid"}
 
     conn = get_db_connection("super")
@@ -179,10 +249,10 @@ async def handle_subscription(Cid: str, duration: int):
 
     try:
         start_dt = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-        original_end_dt = start_dt + relativedelta(months=duration) - timedelta(days=1)
+        original_end_dt = start_dt + relativedelta(months=form.duration) - timedelta(days=1)
         final_end_dt = original_end_dt
 
-        cursor.execute("SELECT * FROM Companies WHERE Cid = ?", (Cid,))
+        cursor.execute("SELECT * FROM Companies WHERE Cid = ?", (form.cid,))
         company = cursor.fetchone()
         if not company:
             return {"status": "bad", "matches": "companyid-not-found"}
@@ -190,7 +260,7 @@ async def handle_subscription(Cid: str, duration: int):
         cursor.execute("""
             SELECT Subid, Enddate FROM Subscriptions
             WHERE Cid = ?
-        """, (Cid,))
+        """, (form.cid,))
         existing = cursor.fetchone()
 
         if existing:
@@ -211,12 +281,12 @@ async def handle_subscription(Cid: str, duration: int):
         cursor.execute("""
             INSERT INTO Subscriptions (Subid, Cid, Cname, Startdate, Duration, Enddate, Status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (new_id, Cid, company[2], start_dt, duration, final_end_dt, 'active'))
+        """, (new_id, form.cid, company[2], start_dt, form.duration, final_end_dt, 'active'))
 
         cursor.execute("""
             INSERT INTO SubscriptionHistory (Subid, Cid, Cname, Startdate, Duration, Enddate)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (new_id, Cid, company[2], start_dt, duration, original_end_dt))
+        """, (new_id, form.cid, company[2], start_dt, form.duration, original_end_dt))
 
         conn.commit()
 
@@ -226,7 +296,7 @@ async def handle_subscription(Cid: str, duration: int):
             "start_date": start_dt,
             "original_end_date": original_end_dt,
             "final_end_date": final_end_dt,
-            "duration": duration
+            "duration": form.duration
         }
 
         return {"status": "ok", "details": sub_detail}
@@ -239,7 +309,7 @@ async def handle_subscription(Cid: str, duration: int):
 
 
 @app.post("/super/get_all_subscriptions")
-async def get_all_subscriptions():
+async def get_all_subscriptions(token_data: dict = Depends(get_current_super_admin)):
 
     conn = get_db_connection("super")
     cursor = conn.cursor()
@@ -271,13 +341,13 @@ async def get_all_subscriptions():
         conn.close()
 
 @app.post("/super/get_all_subscriptions_by_id")
-async def get_all_subscriptions_by_id(Cid: str):
+async def get_all_subscriptions_by_id(form: get_all_subscriptions_by_id, token_data: dict = Depends(get_current_super_admin)):
 
     conn = get_db_connection("super")
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT * FROM SubscriptionHistory WHERE Cid = ?", (Cid,))
+        cursor.execute("SELECT * FROM SubscriptionHistory WHERE Cid = ?", (form.cid,))
         subscriptions = cursor.fetchall()
 
         if not subscriptions:
@@ -305,8 +375,8 @@ async def get_all_subscriptions_by_id(Cid: str):
         conn.close()
 
 @app.post("/super/update_subscriptions")
-async def update_subscriptions(Subid: int, status: str):
-    if status not in ['Active', 'Blocked']:
+async def update_subscriptions(form: update_subscriptions, token_data: dict = Depends(get_current_super_admin)):
+    if form.status not in ['Active', 'Blocked']:
         return {"status": "bad", "matches": "Active-and-Blocked-only-allowed"}
 
     conn = get_db_connection("super")
@@ -317,13 +387,13 @@ async def update_subscriptions(Subid: int, status: str):
             UPDATE Subscriptions
             SET Status = ?
             WHERE Subid = ?
-        """, (status, Subid))
+        """, (form.status, form.subid))
 
         if cursor.rowcount == 0:
             return {"status": "bad", "matches": "Subscription ID not found"}
 
         conn.commit()
-        return {"status": "ok", "matches": f"Subscription {Subid} updated to {status}"}        
+        return {"status": "ok", "matches": f"Subscription {form.subid} updated to {form.status}"}        
 
     except Exception as e:
         conn.rollback()
@@ -356,13 +426,14 @@ async def check_expiring_subscriptions(Cid: str):
 
 
 @app.post("/register_user")
-async def register_user(Cname: str, user_type: str, name: str, val2: str, file: UploadFile = File(...)):
+async def register_user(user_type: str, name: str, val2: str, file: UploadFile = File(...), token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
     
     data = {
-        "Cname": Cname,
         "user_type": user_type,
         "name": name,
         "val2": val2
@@ -439,7 +510,9 @@ async def register_user(Cname: str, user_type: str, name: str, val2: str, file: 
 
 
 @app.post("/entry_match")
-async def match_face_entry(Cname: str, file: UploadFile = File(...)):
+async def match_face_entry(file: UploadFile = File(...), token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -554,7 +627,9 @@ async def match_face_entry(Cname: str, file: UploadFile = File(...)):
 
 
 @app.post("/exit_match") #Type = Exit
-async def match_face_exit(Cname: str, file: UploadFile = File(...)):
+async def match_face_exit(file: UploadFile = File(...), token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -659,7 +734,9 @@ async def match_face_exit(Cname: str, file: UploadFile = File(...)):
 
 
 @app.post("/get_all_employees")
-async def get_all_employees(Cname: str):
+async def get_all_employees(token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -685,7 +762,9 @@ async def get_all_employees(Cname: str):
     }
 
 @app.post("/get_all_visitors")
-async def get_all_visitors(Cname: str):
+async def get_all_visitors(token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -711,7 +790,9 @@ async def get_all_visitors(Cname: str):
     }
 
 @app.post("/update_employee_status")
-async def update_employee_status(Cname: str, emp_id: int, name: str, department: str, status: str):
+async def update_employee_status(emp_id: int, name: str, department: str, status: str, token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -738,7 +819,9 @@ async def update_employee_status(Cname: str, emp_id: int, name: str, department:
 
 
 @app.post("/update_visitor_status")
-async def update_visitor_status(Cname: str, visitor_id: int, name: str, visitor_type: str, status: str):
+async def update_visitor_status(visitor_id: int, name: str, visitor_type: str, status: str, token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"} 
@@ -761,7 +844,9 @@ async def update_visitor_status(Cname: str, visitor_id: int, name: str, visitor_
         conn.close()
 
 @app.post("/delete_employee")
-async def delete_employee(Cname: str, emp_id: int):
+async def delete_employee(emp_id: int, token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -782,7 +867,9 @@ async def delete_employee(Cname: str, emp_id: int):
 
 
 @app.post("/delete_visitor")
-async def delete_visitor(Cname:str, visitor_id: int):
+async def delete_visitor(visitor_id: int, token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -803,30 +890,46 @@ async def delete_visitor(Cname:str, visitor_id: int):
 
 
 @app.post("/super_login")
-async def login(user_id: str = Form(...), password: str = Form(...)):
+async def super_login(form: super_login):
     try:
-        with open("/home/ubuntu/FR_/credentials.txt", "r") as file:
-            credentials = file.readlines()
+        # with open("/home/ubuntu/FR_/credentials.txt", "r") as file:
+        #     credentials = file.readlines()
 
-        for line in credentials:
-            stored_id, stored_password = line.strip().split(":")
+        # for line in credentials:
+        #     stored_id, stored_password = line.strip().split(":")
 
-        if user_id == stored_id and password == stored_password:
-            return {"status": "ok", "matches": "Login successful", "role": "super-admin"}
+        stored_id, stored_password = 'admin', 'Password@123'
+        if form.username == stored_id and form.password == stored_password:
+            payload = {
+                "role": "super-admin"
+            }
 
-        return{"status": "bad", "matches": "invalid-credentials"}
+            token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+            return {
+                "status": "ok",
+                "matches": "login-successfull",
+                "access_token": token,
+                "token_type": "bearer",
+                "role": "super-admin"
+            }
+
+        return {"status": "bad", "matches": "invalid-credentials"}
+
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="Credentials file not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
 
+from datetime import datetime, timedelta
+
 @app.post("/company_login")
-async def company_login(Username: str, password: str):
+async def company_login(form: company_login):
     conn = get_db_connection("super")
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * from companies WHERE Userid = ?", (Username,))
+        cursor.execute("SELECT * from companies WHERE Username = ?", (form.username,))
         User = cursor.fetchone()
 
         if not User:
@@ -834,24 +937,39 @@ async def company_login(Username: str, password: str):
         
         hashed_password = User[3]
 
-        if not bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8')):
-            return {"staus": "bad", "matches": "invalid-credentials"} 
+        if not bcrypt.checkpw(form.password.encode('utf-8'), hashed_password.encode('utf-8')):
+            return {"status": "bad", "matches": "invalid-credentials"} 
         
-        details = {
+        expire_time = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+        payload = {
             "Cid": User[0],
             "Userid": User[1],
             "Cname": User[2],
+            "role": "company-admin",
+            "exp": int(expire_time.timestamp())
         }
 
-        return {"status": "ok", "matches": details, "role": "company-admin"}
+        token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+        return {
+            "status": "ok",
+            "matches": "login-successfull",
+            "access_token": token,
+            "token_type": "bearer",
+            "role": "company-admin"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot login: {e}")
     finally:
         conn.close()
 
+
 @app.post("/get_all_attendance")
-async def get_all_attendance(Cname: str):
+async def get_all_attendance(token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -881,7 +999,9 @@ async def get_all_attendance(Cname: str):
 
 
 @app.post("/get_employee_hours_worked_by_date") #{"name": name, "details": [{'date': '2025-04-22', 'entry': ['09:00', '13:30'], 'exit': ['12:00', '18:00'], 'hours': hh:mm}, ...]}
-async def emp_hours_worked(Cname: str, EmpId: int, start_date: Optional[str] = Query(None), end_date: Optional[str] = Query(None)) -> dict[str, Any]:
+async def emp_hours_worked(EmpId: int, start_date: Optional[str] = Query(None), end_date: Optional[str] = Query(None), token_data: dict = Depends(get_current_company_admin)) -> dict[str, Any]:
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
@@ -959,7 +1079,9 @@ async def emp_hours_worked(Cname: str, EmpId: int, start_date: Optional[str] = Q
         conn.close()
 
 @app.post("/get_visitor_data")
-async def get_visitor_data(Cname: str, VisitorId: int):
+async def get_visitor_data(Cname: str, VisitorId: int, token_data: dict = Depends(get_current_company_admin)):
+
+    Cname = token_data["Cname"]
 
     if get_status(Cname) == "blocked":
         return {"status": "blocked", "matches": "company-blocked"}
