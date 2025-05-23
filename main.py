@@ -892,13 +892,12 @@ async def delete_visitor(visitor_id: int, token_data: dict = Depends(get_current
 @app.post("/super_login")
 async def super_login(form: super_login):
     try:
-        # with open("/home/ubuntu/FR_/credentials.txt", "r") as file:
-        #     credentials = file.readlines()
+        with open("/home/ubuntu/FR_/credentials.txt", "r") as file:
+            credentials = file.readlines()
 
-        # for line in credentials:
-        #     stored_id, stored_password = line.strip().split(":")
+        for line in credentials:
+            stored_id, stored_password = line.strip().split(":")
 
-        stored_id, stored_password = 'admin', 'Password@123'
         if form.username == stored_id and form.password == stored_password:
             payload = {
                 "role": "super-admin"
